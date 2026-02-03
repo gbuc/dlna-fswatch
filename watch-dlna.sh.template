@@ -1,0 +1,119 @@
+#!/bin/bash
+set -euo pipefail
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cd "$SCRIPT_DIR"
+
+# Configuration (populated by install.sh)
+LOG_FILE="$SCRIPT_DIR/fswatch.log"
+CACHE_DIR="{{CACHE_DIR}}"
+DB_FILE="$CACHE_DIR/files.db"
+MEDIA_DIRS=({{MEDIA_DIRS}})
+STATE_DIR="/tmp/minidlna_watcher"
+INACTIVITY_TIMEOUT={{INACTIVITY_TIMEOUT}}
+HOMEBREW_PREFIX="{{HOMEBREW_PREFIX}}"
+
+mkdir -p "$STATE_DIR"
+
+get_key() {
+  local folder="$1"
+  echo "$folder" | sed 's/[^a-zA-Z0-9._-]/_/g'
+}
+
+is_toplevel_folder() {
+  local folder="$1"
+  for base in "${MEDIA_DIRS[@]}"; do
+    if [[ "$folder" == "$base"/* ]]; then
+      local base_slashes=$(echo "$base" | tr -cd '/' | wc -c | tr -d ' ')
+      local folder_slashes=$(echo "$folder" | tr -cd '/' | wc -c | tr -d ' ')
+      if [[ $folder_slashes -eq $((base_slashes + 1)) ]]; then
+        return 0
+      fi
+    fi
+  done
+  return 1
+}
+
+log() {
+  echo "$(date +'%Y-%m-%d %H:%M:%S'): $*" >> "$LOG_FILE"
+}
+
+needs_indexing() {
+  local folder="$1"
+  [ -f "$DB_FILE" ] || return 0
+
+  while IFS= read -r -d '' video; do
+    local escaped="${video//\'/\'\'}"
+    local count=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM DETAILS WHERE PATH='$escaped'")
+    if [[ "$count" -eq 0 ]]; then
+      log "Video not in database: $video"
+      return 0
+    fi
+  done < <(find "$folder" -type f \( -iname "*.mkv" -o -iname "*.mp4" \) -print0 2>/dev/null)
+
+  return 1
+}
+
+trigger_refresh() {
+  local folder="$1"
+  log "Folder $folder inactive >${INACTIVITY_TIMEOUT}s, checking if refresh needed"
+  if needs_indexing "$folder"; then
+    log "New videos found, refreshing DLNA cache"
+    rm -rf "$CACHE_DIR" || log "Warning: Could not delete $CACHE_DIR"
+    "$HOMEBREW_PREFIX/brew" services restart minidlna >> "$LOG_FILE" 2>&1
+    log "DLNA restarted"
+  else
+    log "All videos already indexed, skipping restart"
+  fi
+}
+
+check_inactive() {
+  while true; do
+    shopt -s nullglob
+    for tsfile in "$STATE_DIR"/*.ts; do
+      local key="${tsfile##*/}"
+      key="${key%.ts}"
+      local pathfile="$STATE_DIR/$key.path"
+      [ -f "$pathfile" ] || continue
+      local path="$(cat "$pathfile")"
+      local ts="$(cat "$tsfile")"
+      local now="$(date +%s)"
+      if [ $((now - ts)) -gt "$INACTIVITY_TIMEOUT" ]; then
+        trigger_refresh "$path"
+        rm -f "$pathfile" "$tsfile"
+      fi
+    done
+    sleep 30
+  done
+}
+
+check_inactive &
+CHECKER_PID=$!
+log "Starting MiniDLNA watcher on ${MEDIA_DIRS[*]}"
+
+EVENT_REGEX='(None|PlatformSpecific|Created|Updated|Removed|Renamed|OwnerModified|AttributeModified|MovedFrom|MovedTo|IsFile|IsDir|IsSymLink|Link|Overflow)'
+
+"$HOMEBREW_PREFIX/fswatch" --recursive -x --exclude '\.txt$' --latency 1 "${MEDIA_DIRS[@]}" | while IFS= read -r line; do
+  events=$(echo "$line" | grep -oE "($EVENT_REGEX )*(${EVENT_REGEX})$" || echo "")
+  path="${line% $events}"
+  log "DEBUG: [$events] on $path"
+
+  if [[ "$events" == *"Created"* ]] && [[ "$events" == *"IsDir"* ]]; then
+    folder="$path"
+    is_toplevel_folder "$folder" || continue
+    key=$(get_key "$folder")
+    echo "$folder" > "$STATE_DIR/$key.path"
+    echo "$(date +%s)" > "$STATE_DIR/$key.ts"
+    log "New download folder detected: $folder"
+  elif [[ "$events" == *Updated* ]]; then
+    folder="$(dirname "$path")"
+    is_toplevel_folder "$folder" || continue
+    key=$(get_key "$folder")
+    pathfile="$STATE_DIR/$key.path"
+    if [ -f "$pathfile" ]; then
+      echo "$(date +%s)" > "$STATE_DIR/$key.ts"
+    fi
+  fi
+done
+
+kill "$CHECKER_PID" 2>/dev/null || true
+rm -rf "$STATE_DIR"
