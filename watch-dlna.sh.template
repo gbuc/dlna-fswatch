@@ -41,6 +41,15 @@ needs_indexing() {
   local folder="$1"
   [ -f "$DB_FILE" ] || return 0
 
+  # Determine if this is a media root directory (non-recursive check)
+  local find_depth=""
+  for base in "${MEDIA_DIRS[@]}"; do
+    if [[ "$folder" == "$base" ]]; then
+      find_depth="-maxdepth 1"
+      break
+    fi
+  done
+
   while IFS= read -r -d '' video; do
     local escaped="${video//\'/\'\'}"
     local count=$(sqlite3 "$DB_FILE" "SELECT COUNT(*) FROM DETAILS WHERE PATH='$escaped'")
@@ -48,7 +57,7 @@ needs_indexing() {
       log "Video not in database: $video"
       return 0
     fi
-  done < <(find "$folder" -type f \( -iname "*.mkv" -o -iname "*.mp4" \) -print0 2>/dev/null)
+  done < <(find "$folder" $find_depth -type f \( -iname "*.mkv" -o -iname "*.mp4" \) -print0 2>/dev/null)
 
   return 1
 }
@@ -88,6 +97,24 @@ check_inactive() {
 
 check_inactive &
 CHECKER_PID=$!
+
+# Check for pending state files on startup (handles restart recovery)
+shopt -s nullglob
+for tsfile in "$STATE_DIR"/*.ts; do
+  key="${tsfile##*/}"
+  key="${key%.ts}"
+  pathfile="$STATE_DIR/$key.path"
+  [ -f "$pathfile" ] || continue
+  path="$(cat "$pathfile")"
+  ts="$(cat "$tsfile")"
+  now="$(date +%s)"
+  if [ $((now - ts)) -gt "$INACTIVITY_TIMEOUT" ]; then
+    log "Recovering pending folder from before restart: $path"
+    trigger_refresh "$path"
+    rm -f "$pathfile" "$tsfile"
+  fi
+done
+
 log "Starting MiniDLNA watcher on ${MEDIA_DIRS[*]}"
 
 EVENT_REGEX='(None|PlatformSpecific|Created|Updated|Removed|Renamed|OwnerModified|AttributeModified|MovedFrom|MovedTo|IsFile|IsDir|IsSymLink|Link|Overflow)'
@@ -97,20 +124,53 @@ EVENT_REGEX='(None|PlatformSpecific|Created|Updated|Removed|Renamed|OwnerModifie
   path="${line% $events}"
   log "DEBUG: [$events] on $path"
 
-  if [[ "$events" == *"Created"* ]] && [[ "$events" == *"IsDir"* ]]; then
+  # Handle directory creation or rename at top level
+  if [[ "$events" == *"IsDir"* ]] && [[ "$events" == *"Created"* || "$events" == *"Renamed"* ]]; then
     folder="$path"
-    is_toplevel_folder "$folder" || continue
-    key=$(get_key "$folder")
-    echo "$folder" > "$STATE_DIR/$key.path"
-    echo "$(date +%s)" > "$STATE_DIR/$key.ts"
-    log "New download folder detected: $folder"
-  elif [[ "$events" == *Updated* ]]; then
-    folder="$(dirname "$path")"
-    is_toplevel_folder "$folder" || continue
-    key=$(get_key "$folder")
-    pathfile="$STATE_DIR/$key.path"
-    if [ -f "$pathfile" ]; then
+    if is_toplevel_folder "$folder"; then
+      key=$(get_key "$folder")
+      echo "$folder" > "$STATE_DIR/$key.path"
       echo "$(date +%s)" > "$STATE_DIR/$key.ts"
+      log "New download folder detected: $folder"
+    fi
+  # Handle file events (Created, Renamed, Updated)
+  elif [[ "$events" == *"IsFile"* ]]; then
+    folder="$(dirname "$path")"
+
+    # Check if file is directly in a media directory root
+    is_media_root=false
+    for base in "${MEDIA_DIRS[@]}"; do
+      if [[ "$folder" == "$base" ]]; then
+        is_media_root=true
+        break
+      fi
+    done
+
+    if $is_media_root; then
+      # File directly in media root - track using special key
+      key=$(get_key "$folder")
+      key="${key}_root"
+      if [[ "$events" == *"Created"* || "$events" == *"Renamed"* ]]; then
+        echo "$folder" > "$STATE_DIR/$key.path"
+        log "File detected in media root: $path"
+      fi
+      # Always update timestamp if tracking exists or just created
+      if [ -f "$STATE_DIR/$key.path" ]; then
+        echo "$(date +%s)" > "$STATE_DIR/$key.ts"
+      fi
+    elif is_toplevel_folder "$folder"; then
+      # File in a top-level folder
+      key=$(get_key "$folder")
+      pathfile="$STATE_DIR/$key.path"
+      if [ -f "$pathfile" ]; then
+        # Update existing tracking
+        echo "$(date +%s)" > "$STATE_DIR/$key.ts"
+      elif [[ "$events" == *"Created"* || "$events" == *"Renamed"* ]]; then
+        # Auto-create tracking for folder (handles case where folder wasn't detected)
+        echo "$folder" > "$STATE_DIR/$key.path"
+        echo "$(date +%s)" > "$STATE_DIR/$key.ts"
+        log "Activity in folder (auto-tracked): $folder"
+      fi
     fi
   fi
 done
