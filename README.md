@@ -4,10 +4,13 @@ Auto-refreshes MiniDLNA cache when new video downloads complete.
 
 ## Features
 
-- Monitors specified directories for new folders (downloads)
+- Monitors specified directories for new folders and files
+- Detects folders created, moved, or renamed into place
+- Detects video files added directly to media root directories
 - Waits for download activity to stop (configurable timeout)
 - Checks if videos are already in MiniDLNA database before restarting
 - Only restarts MiniDLNA when new videos need indexing
+- Recovers pending folders after service restart
 - Runs as a launchd service (auto-starts on login)
 
 ## Requirements
@@ -105,12 +108,16 @@ launchctl load ~/Library/LaunchAgents/minidlna-watcher.plist
 ## How It Works
 
 1. `fswatch` monitors media directories recursively
-2. When a new top-level folder is created, tracking begins
+2. Tracking begins when:
+   - A new top-level folder is created or moved/renamed into place
+   - A video file is added directly to a media root directory
+   - A file is created/moved inside a top-level folder (auto-tracks the folder)
 3. File updates reset a countdown timer
 4. When no activity for `INACTIVITY_TIMEOUT` seconds:
    - Check if video files (.mkv, .mp4) exist in MiniDLNA database
    - If new videos found: delete cache and restart MiniDLNA
    - If all videos indexed: skip restart
+5. On restart, any pending folders that exceeded the timeout are processed immediately
 
 ## Uninstallation
 
@@ -132,7 +139,7 @@ rm -rf ~/.config/minidlna
 **Videos not being detected:**
 - Check `fswatch.log` for DEBUG messages
 - Ensure media directories are mounted
-- Verify folder structure (only top-level folders are tracked)
+- Videos in top-level folders and directly in media root are both tracked
 
 **Unnecessary restarts:**
 - Check if MiniDLNA database path is correct
